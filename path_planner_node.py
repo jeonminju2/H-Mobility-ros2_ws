@@ -19,7 +19,7 @@ class PathPlannerNode(Node):
         self.sub_lane_topic = self.declare_parameter('sub_lane_topic', SUB_LANE_TOPIC_NAME).value
         self.pub_topic = self.declare_parameter('pub_topic', PUB_TOPIC_NAME).value
         self.car_center_point = self.declare_parameter('car_center_point', CAR_CENTER_POINT).value
-        
+
         # QoS 설정
         self.qos_profile = QoSProfile(
             reliability=QoSReliabilityPolicy.RELIABLE,
@@ -38,10 +38,10 @@ class PathPlannerNode(Node):
         self.publisher = self.create_publisher(PathPlanningResult, self.pub_topic, self.qos_profile)
 
     def lane_callback(self, msg: LaneInfo):
-        
+
         # 타겟 지점 받아오기
         self.target_points = msg.target_points
-        
+
         # 타겟 지점이 3개 이상 모이면 경로 계획 시작
         if len(self.target_points) >= 3:
             self.plan_path()
@@ -51,27 +51,53 @@ class PathPlannerNode(Node):
         if not self.target_points:
             self.get_logger().warn("No target points available")
             return
-        
+
         # TargetPoint 객체에서 x, y 값 추출
         x_points, y_points = zip(*[(tp.target_x, tp.target_y) for tp in self.target_points])
 
         #차량 앞 범퍼의 중심이 위치한 픽셀 좌표 추가
-        y_points_list, x_points_list = list(y_points), list(x_points) 
+        y_points_list, x_points_list = list(y_points), list(x_points)
         y_points_list.append(self.car_center_point[1])
         x_points_list.append(self.car_center_point[0])
         y_points, x_points = tuple(y_points_list), tuple(x_points_list)
-        
+
         # y 값을 기준으로 정렬 (y가 증가하는 순서로 정렬)
         sorted_points = sorted(zip(y_points, x_points), key=lambda point: point[0])
 
-        # 정렬된 y, x 값을 다시 분리
-        y_points, x_points = zip(*sorted_points)
-        
+        # CubicSpline은 독립변수(y)가 "엄격히 증가"해야 한다. 같은 y를 가진 점이 둘 이상
+        # 있으면(차선 검출이 겹치는 경우 등) 예외가 나서 그 프레임의 경로가 통째로 유실된다.
+        # 그러면 조향이 그 프레임만 이전 값에 멈췄다가 다음 프레임에 갑자기 큰 폭으로
+        # 바뀌면서 "훅" 꺾이는 원인이 될 수 있다. 같은 y는 x를 평균 내서 한 점으로 합친다.
+        deduped_y = []
+        deduped_x_sum = []
+        deduped_count = []
+        for y, x in sorted_points:
+            if deduped_y and abs(deduped_y[-1] - y) < 1e-6:
+                deduped_x_sum[-1] += x
+                deduped_count[-1] += 1
+            else:
+                deduped_y.append(y)
+                deduped_x_sum.append(x)
+                deduped_count.append(1)
+
+        y_points = deduped_y
+        x_points = [x_sum / count for x_sum, count in zip(deduped_x_sum, deduped_count)]
+
+        if len(y_points) < 2:
+            self.get_logger().warn("Not enough distinct points to plan a path")
+            return
+
         # 몇개의 점으로 경로 계획을 하는지 확인
         self.get_logger().info(f"Planning path with {len(y_points)} points")
 
         # 스플라인 보간법을 사용하여 경로 생성
-        cs = CubicSpline(y_points, x_points, bc_type='natural')
+        try:
+            cs = CubicSpline(y_points, x_points, bc_type='natural')
+        except ValueError as e:
+            # 여기서 죽으면 이후 프레임까지 콜백이 영향을 받을 수 있으니, 이 프레임만
+            # 건너뛰고 이전에 퍼블리시된 경로를 그대로 쓰게 한다.
+            self.get_logger().warn(f"Spline fit failed, skipping this frame: {e}")
+            return
 
         # 생성된 경로 점들 (추가적인 점들을 생성하여 부드러운 경로를 얻음)
         y_new = np.linspace(min(y_points), max(y_points), 100)

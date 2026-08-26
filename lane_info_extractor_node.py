@@ -84,7 +84,12 @@ class Yolov8InfoExtractor(Node):
         target_points = []
         # range 는 끝값을 포함하지 않는다. 기존 range(5,155,50) 은 5/55/105 세 점뿐이었고,
         # 스플라인 노드가 4개(차 위치 포함)라 점 하나만 튀어도 경로가 크게 출렁였다.
-        for target_point_y in range(5, 180, 35):  # 5, 40, 75, 110, 145 — 다섯 점
+        # 165는 차 바로 앞을 위한 근접 샘플점이다. motion_planner_node.py 의
+        # LOOKAHEAD_POINTS 를 줄여 "바로 앞"만 보게 했는데, 원래는 그 구간(145~179)에
+        # 실제 검출점이 145 하나뿐이고 179는 차 중심으로 강제로 붙인 점이라 차선
+        # 정보가 아니었다. 165를 추가해서 근접 구간의 기울기가 검출점 두 개(145, 165)
+        # 로 결정되게 하여, 점 하나의 노이즈에 그대로 흔들리지 않게 한다.
+        for target_point_y in list(range(5, 180, 35)) + [165]:  # 5, 40, 75, 110, 145, 165 — 여섯 점
             target_point_x = CPFL.get_lane_center(roi_image, detection_height=target_point_y, 
                                                 detection_thickness=10, road_gradient=grad, lane_width=300)
             

@@ -86,7 +86,11 @@ def dominant_gradient(image, theta_limit):
 				os.mkdir(exception_image_path)    
 		except OSError:
 			print('Error: Creating directory. ' + exception_image_path)
-		return 0, None
+		# 정상 경로(return result)는 숫자 하나를 돌려주는데 여기만 튜플(0, None)을
+		# 돌려주고 있었다. 호출부(lane_info_extractor_node.py)는 이 값을 road_gradient
+		# 로 그대로 써서 `road_gradient > 0` 비교를 하는데, 튜플이 들어오면
+		# TypeError 로 콜백이 죽고 노드가 통째로 멈춘다. 정상 경로와 타입을 맞춘다.
+		return 0.
 
 def warpping(image, srcmat, dstmat):
 	(h, w) = (image.shape[0], image.shape[1])
@@ -154,9 +158,22 @@ def get_lane_center(cv_image: np.array, detection_height: int, detection_thickne
 	
 	cut_outliers_array = detected_x_coords[1:-1]
 	difference_array = cut_outliers_array[1:] - cut_outliers_array[:-1]
-	
-	max_diff_idx_left = np.argmax(difference_array)
-	max_diff_idx_right = np.argmax(difference_array)+1
+
+	# 기존에는 이 줄에서 "가장 넓은 간격"을 무조건 지금 달리는 차선으로 봤다. 2차선
+	# 도로에서 옆 차선 선까지 잠깐 lane2 로 잘못 잡히는 등 노이즈가 끼면, 그중 어느 게
+	# 진짜 내 차선인지 구분할 방법이 없어 엉뚱한 간격을 고를 수 있었다.
+	# 차는 항상 자기 차선 "안"에 있다는 전제로, 차량 중심(image_width/2)을 사이에 두고
+	# 있는 간격을 우선 선택한다. 중심 좌우 어느 한쪽에 선이 아예 없으면(차선을 크게
+	# 벗어났거나 한쪽 선만 보이는 경우) 참고할 중심 기준이 없으니 기존 방식(가장 넓은
+	# 간격)으로 폴백한다.
+	car_center_x = image_width / 2
+	straddle_idx = np.searchsorted(cut_outliers_array, car_center_x)
+	if 0 < straddle_idx < cut_outliers_array.shape[0]:
+		max_diff_idx_left = straddle_idx - 1
+		max_diff_idx_right = straddle_idx
+	else:
+		max_diff_idx_left = np.argmax(difference_array)
+		max_diff_idx_right = max_diff_idx_left + 1
 	left_val = cut_outliers_array[max_diff_idx_left]
 	right_val = cut_outliers_array[max_diff_idx_right]
 	
