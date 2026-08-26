@@ -1,0 +1,39 @@
+# ---- ROS2 빌드 산출물 (커밋하지 않음) ----
+build/
+install/
+log/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+*.so
+
+# ---- 학습 데이터 / 모델 (용량 큼, 별도 관리) ----
+*.pt
+*.pth
+*.onnx
+*.engine
+datasets/
+dataset/
+images/
+*.jpg
+*.jpeg
+*.png
+*.avi
+*.mp4
+
+# ---- 주행 로그 ----
+drive_logs/
+*.csv
+
+# ---- 예외 이미지 ----
+exception_image/
+
+# ---- OS / 에디터 ----
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
