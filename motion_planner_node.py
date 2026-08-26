@@ -42,9 +42,12 @@ MAX_STEERING = 7          # 최대 7
 #   1) 저역통과 필터: target_slope 자체를 부드럽게 만들어 프레임 간 튀는 값을 완화
 #   2) PID: 비례(P) 외에 미분(D)으로 사행을 누르고, 필요하면 적분(I)로 한쪽 쏠림을 보정
 #   3) 변화율 제한: 조향값이 한 틱에 너무 크게 바뀌지 않도록 제한 (물리적 "훅" 방지)
-STEER_KP = 0.35                # 비례항. 기존 STEERING_GAIN 과 동일한 의미/기본값.
-STEER_KI = 0.0                 # 적분항. 한쪽 선으로 계속 치우쳐 달리는 정상상태 오차가 보이면
+STEER_KP = 0.25                # 비례항. 실주행 튜닝값(기존 0.35 -> 0.25).
+STEER_KI = 0.05                 # 적분항. 한쪽 선으로 계속 치우쳐 달리는 정상상태 오차가 보이면
                                 # 0.01~0.05부터 아주 조금씩만 올려본다. 너무 올리면 천천히 진동한다.
+                                # 실주행 튜닝값(기존 0.0 -> 0.05). 0이 아니게 된 만큼, 직선에서
+                                # 커브 때 쌓인 적분이 안 빠지고 남아있지 않도록 PID.compute() 에서
+                                # 에러가 0(데드밴드에 걸린 경우)이면 적분도 같이 비워준다.
 STEER_KD = 0.12                # 미분항. 사행(좌우로 훅훅 도는 것)을 누르는 역할.
                                 # 0에서 시작해서 0.05씩 올려가며 가장 안 흔들리는 지점을 찾는다.
                                 # 너무 크게 잡으면 반대로 고주파 떨림이 생긴다.
@@ -152,6 +155,14 @@ class PID:
         if dt <= 0:
             dt = 1e-3
 
+        # error 가 정확히 0인 프레임은(motion_planner_node.py 의 apply_deadband 를 거쳐서
+        # 들어옴) "직선으로 확정"한 경우다. 여기서 적분을 비우지 않으면, 커브를 도는 동안
+        # 쌓인 적분값이 자연 감쇠 없이 그대로 남아 있다가 직선 구간에서도 계속 작은
+        # 조향 오프셋을 만들어 미세한 출렁임의 원인이 된다. KI 가 0이면 어차피 i_term 이
+        # 0이라 영향 없다.
+        if error == 0.0:
+            self._integral = 0.0
+
         p_term = self.kp * error
 
         d_term = 0.0
@@ -194,7 +205,8 @@ class MotionPlanningNode(Node):
     """
     주행 상태 기계
 
-        WAIT_GREEN  정지. 신호등 Green 을 연속으로 받으면 출발한다.
+        WAIT_GREEN  정지. 신호등 Green 을 연속으로 받고, 검출/경로 토픽에서 메시지를
+                    한 번이라도 받았을 때(=관련 노드가 다 떠서 살아있을 때) 출발한다.
                     한 번 출발하면 신호등은 두 번 다시 보지 않는다(래치).
         DRIVE       최고속 차선 추종. 박스 지표가 SLOW_THRESHOLD 를 넘으면 SLOW.
         SLOW        감속 상태로 계속 차선 추종. STOP_THRESHOLD 를 넘으면 STOP.
@@ -231,6 +243,14 @@ class MotionPlanningNode(Node):
         self.wait_ticks = 0
         self.slow_streak = 0
         self.stop_streak = 0
+
+        # 다른 노드(YOLO 검출, path_planner 등)가 뒤늦게 켜지는 경우를 대비한 준비 상태
+        # 플래그. 각 토픽에서 메시지를 한 번이라도 받으면 True 로 바뀐다(내용은 안 봄,
+        # 그 노드가 살아서 발행 중이라는 사실만 확인). Green 신호를 받아도 이 두 개가
+        # 모두 True 가 되기 전에는 DRIVE 로 넘어가지 않는다 — 그래야 경로/검출 데이터가
+        # 없는 채로(즉 조향 0에 속도만 붙은 상태로) 출발하는 걸 막을 수 있다.
+        self.detection_ready = False
+        self.path_ready = False
 
         self.metric_buf = deque(maxlen=MEDIAN_WINDOW)
         self.box_value = None      # 중앙값 필터를 거친 박스 지표. 미검출이면 None
@@ -318,6 +338,7 @@ class MotionPlanningNode(Node):
 
     def detection_callback(self, msg: DetectionArray):
         """박스 지표를 뽑아 중앙값 필터에 넣는다."""
+        self.detection_ready = True
         best = None
         for detection in msg.detections:
             if detection.class_name != BOX_CLASS:
@@ -337,6 +358,7 @@ class MotionPlanningNode(Node):
         self.box_value = statistics.median(self.metric_buf)
 
     def path_callback(self, msg: PathPlanningResult):
+        self.path_ready = True
         self.path_data = list(zip(msg.x_points, msg.y_points))
 
     def traffic_light_callback(self, msg: String):
@@ -390,9 +412,21 @@ class MotionPlanningNode(Node):
                 f"'{self.sub_traffic_light_topic}' 토픽을 한 번도 받지 못했다. "
                 f"traffic_light_detector_node 가 떠 있는지 확인할 것.")
 
-        if self.green_streak >= GREEN_CONFIRM_FRAMES:
+        # 검출/경로 노드가 아직 안 떠 있으면(둘 다 준비되기 전이면), Green 이 들어와도
+        # 출발하지 않는다. 여기서 안 막으면 경로 데이터가 없는 채로(조향 0, 속도만 최고속)
+        # DRIVE 에 들어가서, 뒤늦게 노드가 켜지는 순간 갑자기 조향이 튀는 딜레이가 생긴다.
+        not_ready = []
+        if not self.detection_ready:
+            not_ready.append(self.sub_detection_topic)
+        if not self.path_ready:
+            not_ready.append(self.sub_path_topic)
+        if not_ready and self.wait_ticks % 50 == 0:
+            self.get_logger().warn(
+                f"아직 메시지를 못 받은 토픽: {not_ready}. 관련 노드가 켜져 있는지 확인할 것.")
+
+        if self.green_streak >= GREEN_CONFIRM_FRAMES and not not_ready:
             self.state = 'DRIVE'
-            self.get_logger().info(f"Green {self.green_streak}프레임 확인 -> 출발")
+            self.get_logger().info(f"Green {self.green_streak}프레임 확인, 모든 노드 준비 완료 -> 출발")
 
     def run_driving(self, speed: int):
         # 라이다를 쓰는 경우에만 동작한다. 노드를 안 띄우면 lidar_data 는 계속 None.
